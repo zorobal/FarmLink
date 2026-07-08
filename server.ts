@@ -2,13 +2,34 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
+import { createClient } from "@supabase/supabase-js";
+import * as dotenv from "dotenv";
 import { 
   UserRole, Profile, Region, DeliveryZone, VendeurDetails, 
   Category, Product, PrixMarche, Promotion, Commande, 
   Reclamation, EvaluationVendeur, DriverDetails, NotificationLog, CommandeItem 
-} from "./src/types";
+} from "./src/types.js";
+
+// Load environment variables
+dotenv.config();
 
 const DB_FILE = path.join(process.cwd(), "farm_db.json");
+
+// Initialize Supabase Client
+const supabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
+const supabaseAnonKey = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
+
+let supabase: any = null;
+if (supabaseUrl && supabaseAnonKey) {
+  try {
+    supabase = createClient(supabaseUrl, supabaseAnonKey);
+    console.log("[Supabase] Client initialized successfully.");
+  } catch (err) {
+    console.error("[Supabase] Failed to initialize Supabase client:", err);
+  }
+} else {
+  console.log("[Supabase] Credentials missing. Running with local JSON database fallback.");
+}
 
 // Default Cameroonian seed data
 const SEED_DATA = {
@@ -297,8 +318,57 @@ const SEED_DATA = {
   }
 };
 
-// Database utility functions
-function readDb() {
+// Database utility functions & Supabase Synchronization
+let memoryDbState: any = null;
+
+async function syncFromSupabase() {
+  if (!supabase) return null;
+  try {
+    const { data, error } = await supabase
+      .from("farmlink_state")
+      .select("data")
+      .eq("key", "farmlink")
+      .single();
+
+    if (error) {
+      if (error.code === "PGRST116" || error.message?.includes("0 rows") || error.message?.includes("relation") || error.message?.includes("does not exist")) {
+        console.log("[Supabase] Row 'farmlink' or table 'farmlink_state' not found. Initializing with local seed data...");
+        const initial = readDbLocal();
+        await syncToSupabase(initial);
+        return initial;
+      }
+      console.warn("[Supabase] Error reading farmlink_state:", error.message);
+      return null;
+    }
+
+    if (data && data.data) {
+      console.log("[Supabase] Successfully synchronized state from cloud database.");
+      return data.data;
+    }
+  } catch (err: any) {
+    console.warn("[Supabase] Unexpected error during cloud synchronization:", err.message || err);
+  }
+  return null;
+}
+
+async function syncToSupabase(stateData: any) {
+  if (!supabase) return;
+  try {
+    const { error } = await supabase
+      .from("farmlink_state")
+      .upsert({ key: "farmlink", data: stateData, updated_at: new Date().toISOString() });
+
+    if (error) {
+      console.error("[Supabase] Error saving state to cloud:", error.message);
+    } else {
+      console.log("[Supabase] Successfully saved state to cloud database.");
+    }
+  } catch (err: any) {
+    console.error("[Supabase] Unexpected error during sync to cloud:", err.message || err);
+  }
+}
+
+function readDbLocal() {
   try {
     if (!fs.existsSync(DB_FILE)) {
       fs.writeFileSync(DB_FILE, JSON.stringify(SEED_DATA, null, 2), "utf8");
@@ -312,24 +382,51 @@ function readDb() {
   }
 }
 
+function readDb() {
+  if (memoryDbState) {
+    return memoryDbState;
+  }
+  const local = readDbLocal();
+  memoryDbState = local;
+  return local;
+}
+
 function writeDb(data: any) {
+  memoryDbState = data;
   try {
     fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf8");
   } catch (error) {
     console.error("Error writing database file:", error);
   }
+  if (supabase) {
+    syncToSupabase(data);
+  }
 }
 
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
+export const app = express();
+const PORT = 3000;
 
-  app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "10mb" }));
 
-  // Helper middleware to get database state
-  const getDbState = () => readDb();
+// Helper middleware to get database state
+const getDbState = () => readDb();
 
-  // --- API ROUTES ---
+// Load initial database state from Supabase if configured at startup in background
+if (supabase) {
+  console.log("[Supabase] Triggering initial database sync...");
+  syncFromSupabase().then(cloudState => {
+    if (cloudState) {
+      memoryDbState = cloudState;
+      try {
+        fs.writeFileSync(DB_FILE, JSON.stringify(cloudState, null, 2), "utf8");
+      } catch (err) {
+        console.error("Failed to sync cloud data to local disk:", err);
+      }
+    }
+  });
+}
+
+// --- API ROUTES ---
 
   // Health check
   app.get("/api/health", (req, res) => {
@@ -965,24 +1062,28 @@ async function startServer() {
   });
 
   // --- VITE MIDDLEWARE SETUP ---
+  async function startServer() {
+    if (process.env.NODE_ENV !== "production") {
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.join(process.cwd(), "dist");
+      app.use(express.static(distPath));
+      app.get("*", (req, res) => {
+        res.sendFile(path.join(distPath, "index.html"));
+      });
+    }
 
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+    if (!process.env.VERCEL) {
+      app.listen(PORT, "0.0.0.0", () => {
+        console.log(`[FarmLink Express] Server listening on http://0.0.0.0:${PORT}`);
+      });
+    }
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[FarmLink Express] Server listening on http://0.0.0.0:${PORT}`);
-  });
-}
+  startServer();
 
-startServer();
+  export default app;
