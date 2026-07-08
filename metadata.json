@@ -1,0 +1,6 @@
+{
+  "name": "FarmLink Cameroon",
+  "description": "Plateforme nationale de mise en relation de confiance entre éleveurs/agriculteurs et clients au Cameroun, intégrant une gestion des stocks multi-vendeurs, des tarifs de livraison par zone et une administration régionale déléguée.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
